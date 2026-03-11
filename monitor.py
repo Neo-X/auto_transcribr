@@ -142,23 +142,10 @@ def build_ffmpeg_cmd(output_path: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def is_zoom_running() -> bool:
-    # Check window titles first — Zoom keeps its process alive after a meeting ends,
-    # so we look for a window that indicates an active meeting.
+    # Zoom keeps its process alive after a meeting ends, so we must check window
+    # titles to determine whether an active meeting is in progress.
     titles = get_window_titles()
-    if titles:
-        return "zoom meeting" in titles
-
-    # Fallback: no window tool available — check process existence.
-    # This is unreliable (Zoom stays running after meetings) but better than nothing.
-    for proc in psutil.process_iter(["name", "cmdline"]):
-        try:
-            name = (proc.info["name"] or "").lower()
-            cmdline = " ".join(proc.info["cmdline"] or []).lower()
-            if "zoom" in name or "zoom" in cmdline:
-                return True
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    return False
+    return "zoom meeting" in titles
 
 
 def get_window_titles() -> str:
