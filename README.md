@@ -1,6 +1,6 @@
 # Transcriber
 
-Automatically records audio when a Zoom or Google Meet meeting is detected, then transcribes it using a local Whisper model. Saves timestamped WAV and TXT files to `~/recordings/`.
+Automatically records audio when a Zoom or Google Meet meeting is detected, then transcribes it with speaker diarization using a local WhisperX model. Saves timestamped WAV and TXT files to `~/recordings/`.
 
 ## How It Works
 
@@ -11,15 +11,39 @@ Automatically records audio when a Zoom or Google Meet meeting is detected, then
 3. **Recording** — when a meeting is detected, `ffmpeg` starts capturing audio:
    - Microphone via the PulseAudio/PipeWire default input source.
    - System audio via the default sink's monitor source (what plays through your speakers), if available.
-   - Both streams are mixed into a single mono WAV file at 16 kHz / 16-bit (Whisper's native format).
+   - Both streams are mixed into a stereo WAV file at 16 kHz / 16-bit. Stereo is preserved to give the diarization model better signal for separating speakers.
 4. **Stop** — when the meeting ends (process gone / window closed), `ffmpeg` is stopped and the file is finalized.
-5. **Transcription** — `faster-whisper` automatically transcribes the recording in the background and saves a `.txt` file alongside the WAV.
+5. **Transcription** — WhisperX automatically transcribes the recording in the background and saves a `.txt` file alongside the WAV. If `HF_TOKEN` is set, speaker diarization runs and labels each speaker in the output.
 
 Recordings are saved to `~/recordings/meeting_YYYY-MM-DD_HH-MM-SS.wav` with a matching `meeting_YYYY-MM-DD_HH-MM-SS.txt` transcript.
 
-## Whisper Model
+## Transcript Format
 
-Transcription uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper), a CTranslate2-based reimplementation of OpenAI Whisper that runs at ~4x the speed with half the VRAM via INT8 quantization.
+Without diarization (`HF_TOKEN` not set), the transcript is plain text:
+
+```
+Let's get started with the agenda.
+Sure, I wanted to follow up on last week's items.
+```
+
+With diarization, speakers are labeled and grouped:
+
+```
+[SPEAKER_00]
+Let's get started with the agenda.
+
+[SPEAKER_01]
+Sure, I wanted to follow up on last week's items.
+
+[SPEAKER_00]
+Right, so the first item was...
+```
+
+## WhisperX Model
+
+Transcription uses [WhisperX](https://github.com/m-bain/whisperX), which extends Whisper with:
+- **Word-level timestamp alignment** for precise speaker attribution
+- **Speaker diarization** via [pyannote.audio](https://github.com/pyannote/pyannote-audio)
 
 The default model is **`medium` with INT8 quantization**, which is the recommended setting for a 4 GB GPU (e.g. RTX 4060 laptop):
 
@@ -35,6 +59,22 @@ The default model is **`medium` with INT8 quantization**, which is the recommend
 Models are downloaded automatically from Hugging Face on first use and cached in `~/.cache/huggingface/`.
 
 To change the model, edit `WHISPER_MODEL` and `WHISPER_COMPUTE` at the top of `monitor.py`.
+
+## Speaker Diarization Setup
+
+Diarization requires a free [Hugging Face](https://huggingface.co) account and accepting the terms for two models:
+
+1. Visit [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) and accept the terms.
+2. Visit [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) and accept the terms.
+3. Generate a token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
+4. Export it before running:
+
+```bash
+export HF_TOKEN=your_token_here
+uv run monitor.py
+```
+
+If `HF_TOKEN` is not set, transcription still works but speaker labels are omitted.
 
 ## Requirements
 
@@ -53,6 +93,7 @@ sudo apt install ffmpeg wmctrl
 
 **Run directly (no install needed):**
 ```bash
+export HF_TOKEN=your_token_here
 uv run monitor.py
 ```
 
@@ -62,18 +103,20 @@ chmod +x monitor.py
 ./monitor.py
 ```
 
-**Or install as a system command:**
+**Batch-transcribe existing recordings:**
 ```bash
-uv tool install .
-transcriber
+export HF_TOKEN=your_token_here
+uv run transcribe.py [recordings_dir]
 ```
+
+If `recordings_dir` is omitted, defaults to `~/recordings/`. Only WAV files without a matching `.txt` are processed.
 
 ## Notes
 
 - **Wayland**: `wmctrl` requires X11. On a pure Wayland session without XWayland, Google Meet detection falls back to checking browser process arguments (works if Meet is launched as a PWA, less reliable otherwise). Install `wmctrl` and ensure XWayland is active for best results.
 - **System audio**: If no PulseAudio monitor source is found (e.g. on a headless machine), only the microphone is recorded.
 - **Zoom**: Recording starts when the Zoom application launches, not when a call begins.
-- **First run**: The Whisper model (~1.5 GB for medium) is downloaded on first transcription. Subsequent runs use the local cache.
+- **First run**: The Whisper model (~1.5 GB for medium) and pyannote diarization models are downloaded on first use and cached in `~/.cache/huggingface/`.
 - **CPU fallback**: If no CUDA GPU is available, transcription falls back to CPU automatically. Expect ~10–20x slower than GPU.
 
 ## Stopping

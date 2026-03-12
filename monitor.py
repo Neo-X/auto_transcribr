@@ -8,8 +8,12 @@ Requirements:
   - PulseAudio or PipeWire (with PulseAudio compatibility)
   - wmctrl or xdotool  (for Google Meet detection on X11)
   - psutil, pystray, pillow  (uv add psutil pystray pillow)
+  - whisperx  (uv add whisperx)
+
+Set HF_TOKEN env var to enable speaker diarization via pyannote.
 """
 
+import os
 import re
 import signal
 import subprocess
@@ -21,7 +25,7 @@ from pathlib import Path
 
 import psutil
 import pystray
-from faster_whisper import WhisperModel
+import whisperx
 from PIL import Image, ImageDraw
 
 RECORDINGS_DIR = Path.home() / "recordings"
@@ -29,6 +33,7 @@ POLL_INTERVAL = 3  # seconds between checks
 
 WHISPER_MODEL   = "medium"   # tiny / base / small / medium / large-v3 / turbo
 WHISPER_COMPUTE = "int8"     # int8 (recommended) or float16
+BATCH_SIZE      = 16
 
 
 # ---------------------------------------------------------------------------
@@ -113,8 +118,8 @@ def build_ffmpeg_cmd(output_path: Path) -> list[str]:
     """
     monitor = find_monitor_source()
 
-    # Whisper expects 16 kHz, 16-bit, mono PCM
-    whisper_args = ["-ar", "16000", "-ac", "1", "-sample_fmt", "s16", "-vn"]
+    # WhisperX expects 16 kHz, 16-bit, stereo helps diarization distinguish speakers
+    whisper_args = ["-ar", "16000", "-ac", "2", "-sample_fmt", "s16", "-vn"]
 
     if monitor:
         cmd = [
@@ -257,41 +262,77 @@ class MeetingRecorder:
 # Transcription
 # ---------------------------------------------------------------------------
 
-_whisper_model: WhisperModel | None = None
+_whisper_model = None
 _whisper_lock = threading.Lock()
+_device: str | None = None
 
 
-def get_whisper_model() -> WhisperModel:
-    global _whisper_model
+def _get_device() -> str:
+    try:
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() > 0:
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def get_whisper_model():
+    global _whisper_model, _device
     with _whisper_lock:
         if _whisper_model is None:
-            print(f"[transcriber] Loading Whisper model '{WHISPER_MODEL}' ({WHISPER_COMPUTE})...")
-            device = "cuda" if _cuda_available() else "cpu"
-            _whisper_model = WhisperModel(WHISPER_MODEL, device=device, compute_type=WHISPER_COMPUTE)
-            print(f"[transcriber] Model loaded on {device}.")
+            _device = _get_device()
+            print(f"[transcriber] Loading WhisperX model '{WHISPER_MODEL}' ({WHISPER_COMPUTE}) on {_device}...")
+            _whisper_model = whisperx.load_model(WHISPER_MODEL, _device, compute_type=WHISPER_COMPUTE)
+            print("[transcriber] Model loaded.")
     return _whisper_model
 
 
-def _cuda_available() -> bool:
-    try:
-        import ctranslate2
-        return ctranslate2.get_cuda_device_count() > 0
-    except Exception:
-        return False
-
-
 def transcribe(audio_path: Path, tray: TrayIcon):
-    """Transcribe audio_path and save a .txt file alongside it."""
+    """Transcribe audio_path with speaker diarization and save a .txt file alongside it."""
     txt_path = audio_path.with_suffix(".txt")
     print(f"[transcriber] Transcribing {audio_path.name}...")
     tray.set_transcribing()
 
+    hf_token = os.environ.get("HF_TOKEN")
+
     try:
         model = get_whisper_model()
-        segments, info = model.transcribe(str(audio_path), beam_size=5)
+        audio = whisperx.load_audio(str(audio_path))
+
+        # Step 1: transcribe
+        result = model.transcribe(audio, batch_size=BATCH_SIZE)
+        language = result["language"]
+        print(f"[transcriber] Detected language: {language}")
+
+        # Step 2: align word-level timestamps
+        align_model, metadata = whisperx.load_align_model(language_code=language, device=_device)
+        result = whisperx.align(
+            result["segments"], align_model, metadata, audio, _device, return_char_alignments=False
+        )
+
+        # Step 3: diarize (requires HF token)
+        if hf_token:
+            print("[transcriber] Running speaker diarization...")
+            diarize_model = whisperx.DiarizationPipeline(use_auth_token=hf_token, device=_device)
+            diarize_segments = diarize_model(audio)
+            result = whisperx.assign_word_speakers(diarize_segments, result)
+        else:
+            print("[transcriber] HF_TOKEN not set — skipping diarization (no speaker labels).")
+
+        # Step 4: write transcript grouped by speaker
         with txt_path.open("w") as f:
-            for segment in segments:
-                f.write(segment.text.strip() + "\n")
+            current_speaker = None
+            for segment in result["segments"]:
+                speaker = segment.get("speaker", "UNKNOWN")
+                text = segment["text"].strip()
+                if speaker != current_speaker:
+                    if current_speaker is not None:
+                        f.write("\n")
+                    f.write(f"[{speaker}]\n")
+                    current_speaker = speaker
+                f.write(text + "\n")
+
         print(f"[transcriber] Transcript saved → {txt_path}")
     except Exception as e:
         print(f"[transcriber] Error: {e}")
