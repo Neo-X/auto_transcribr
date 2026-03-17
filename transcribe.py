@@ -66,7 +66,10 @@ def transcribe_file(model, audio_path: Path, device: str, hf_token: str | None) 
         if hf_token:
             print("[transcriber] Running speaker diarization...")
             diarize_model = whisperx.DiarizationPipeline(use_auth_token=hf_token, device=device)
-            diarize_segments = diarize_model(audio)
+            # Pass pre-loaded waveform dict to avoid torchcodec dependency in pyannote
+            import torch
+            audio_input = {"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": 16000}
+            diarize_segments = diarize_model(audio_input)
             result = whisperx.assign_word_speakers(diarize_segments, result)
         else:
             print("[transcriber] HF_TOKEN not set — skipping diarization (no speaker labels).")
