@@ -27,7 +27,7 @@ from pynput import keyboard
 import subprocess
 
 SAMPLE_RATE = 16000
-WHISPER_MODEL = "base"   # base is fast enough for short clips; bump to small/medium for accuracy
+WHISPER_MODEL = "small"  # small balances speed and accuracy; use medium for more accuracy
 WHISPER_COMPUTE = "int8"
 
 HOTKEY = frozenset([keyboard.Key.ctrl, keyboard.Key.shift, keyboard.Key.space])
