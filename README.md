@@ -86,7 +86,15 @@ If `HF_TOKEN` is not set, transcription still works but speaker labels are omitt
 - NVIDIA GPU with 4 GB+ VRAM recommended (CPU fallback supported, but slow)
 
 ```bash
-sudo apt install ffmpeg wmctrl
+sudo apt install ffmpeg wmctrl libportaudio2
+```
+
+### dictate.py additional requirements
+
+`dictate.py` requires `libportaudio2` for microphone input. If you see a `GLIBCXX` version error when running in a conda environment (conda's `libstdc++` is older than what `libjack` requires), preload the system library:
+
+```bash
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 python dictate.py
 ```
 
 ## Installation & Usage
