@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/gberseth/playground/Obsidian/**)",
+      "Read(//home/gberseth/playground/Obsidian/Transcripts/**)"
+    ]
+  }
+}
