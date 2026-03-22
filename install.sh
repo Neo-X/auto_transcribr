@@ -9,7 +9,8 @@ sudo apt-get install -y \
     xdotool \
     xclip \
     libportaudio2 \
-    portaudio19-dev
+    portaudio19-dev \
+    wtype
 
 echo "Done. Optional extras:"
 echo "  wtype  — Wayland paste support: sudo apt install wtype"

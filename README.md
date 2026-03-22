@@ -102,6 +102,12 @@ sudo apt install wtype
 sudo apt install xclip
 ```
 
+For better Wayland support, also install:
+
+```bash
+sudo apt install wl-clipboard ydotool
+```
+
 **Usage notes:**
 
 - Run `dictate.py` in a **dedicated terminal**. Do not try to dictate into the terminal running the script — the Python process will receive the paste instead of the shell, producing `^[[200~` garbage.
@@ -111,6 +117,42 @@ sudo apt install xclip
 
 ```bash
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 python dictate.py
+```
+
+### Dictation typing backends
+
+`dictate.py` now supports multiple output backends and tries them in order:
+
+1. `wtype` (Wayland virtual keyboard protocol)
+2. `ydotool` (uinput-based keyboard injection)
+3. clipboard + `xdotool` paste
+4. clipboard only (manual paste)
+
+Override backend selection with:
+
+```bash
+DICTATE_TYPE_BACKEND=auto    uv run dictate.py
+DICTATE_TYPE_BACKEND=wtype   uv run dictate.py
+DICTATE_TYPE_BACKEND=ydotool uv run dictate.py
+DICTATE_TYPE_BACKEND=xdotool uv run dictate.py
+```
+
+If your compositor does not support the virtual keyboard protocol, `wtype` will fail with an error like "Compositor does not support the virtual keyboard protocol". In that case, use `ydotool` or fall back to clipboard paste.
+
+### Wayland recording controls
+
+On Wayland, `dictate.py` defaults to terminal control mode (press Enter to start/stop recording), because global hotkeys are often blocked.
+
+To try Ctrl+Shift+Space on Wayland anyway:
+
+```bash
+DICTATE_WAYLAND_CONTROL=hotkey uv run dictate.py
+```
+
+To force terminal control mode:
+
+```bash
+DICTATE_WAYLAND_CONTROL=terminal uv run dictate.py
 ```
 
 ## Installation & Usage
