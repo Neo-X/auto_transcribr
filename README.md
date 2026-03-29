@@ -108,6 +108,14 @@ For better Wayland support, also install:
 sudo apt install wl-clipboard ydotool
 ```
 
+For global hotkeys on Wayland, install and allow `evdev` access:
+
+```bash
+uv add evdev
+sudo usermod -aG input $USER
+# log out and back in after adding the group
+```
+
 **Usage notes:**
 
 - Run `dictate.py` in a **dedicated terminal**. Do not try to dictate into the terminal running the script — the Python process will receive the paste instead of the shell, producing `^[[200~` garbage.
@@ -141,19 +149,29 @@ If your compositor does not support the virtual keyboard protocol, `wtype` will 
 
 ### Wayland recording controls
 
-On Wayland, `dictate.py` defaults to terminal control mode (press Enter to start/stop recording), because global hotkeys are often blocked.
+`dictate.py` uses **toggle recording**: press `Ctrl+Shift+Space` once to start, press again to stop and transcribe.
 
-To try Ctrl+Shift+Space on Wayland anyway:
+On Wayland, `dictate.py` defaults to `auto` mode:
+- Try global hotkeys with `evdev` first (works across applications if input permissions are available)
+- Fall back to terminal mode when unavailable
 
-```bash
-DICTATE_WAYLAND_CONTROL=hotkey uv run dictate.py
-```
-
-To force terminal control mode:
+Force specific mode with `DICTATE_WAYLAND_CONTROL`:
 
 ```bash
+DICTATE_WAYLAND_CONTROL=auto    uv run dictate.py
+DICTATE_WAYLAND_CONTROL=evdev   uv run dictate.py
+DICTATE_WAYLAND_CONTROL=pynput  uv run dictate.py
 DICTATE_WAYLAND_CONTROL=terminal uv run dictate.py
 ```
+
+Mode notes:
+- `evdev`: best option for global hotkeys on Wayland; requires access to `/dev/input/event*`
+- `pynput`: can work on X11; often blocked on Wayland compositors
+- `terminal`: Enter toggles recording in the terminal window
+
+If you added yourself to the `input` group recently, start a new login session (or run `newgrp input` in the current shell) before starting `dictate.py`.
+
+For auto-typing with `ydotool`, `/dev/uinput` must also be writable by your user (or by a group your user is in). If `dictate.py` logs `/dev/uinput not writable`, typing injection is blocked by system permissions; dictation will still copy text to clipboard for manual paste.
 
 ## Installation & Usage
 
