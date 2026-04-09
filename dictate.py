@@ -105,51 +105,47 @@ def _can_use_ydotool() -> bool:
 def type_text(text: str, window_id: str | None = None, is_terminal: bool = False):
     session = os.environ.get("XDG_SESSION_TYPE", "").lower()
     copied = _set_clipboard(text)
-    if "wayland" in session:
-        # ydotool requires writable /dev/uinput.
-        if _can_use_ydotool():
-            try:
-                subprocess.run(["ydotool", "type", "--", text], check=True)
-                return
-            except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
-                print(f"[dictate] ydotool type failed, falling back: {exc}", flush=True)
-                pass
-        else:
-            print("[dictate] /dev/uinput not writable; skipping ydotool injection.", flush=True)
+    paste_key = "ctrl+shift+v" if is_terminal else "ctrl+v"
 
-        # wtype as fallback (works on wlroots-based compositors)
+    if "wayland" in session:
+        # wtype injects text directly into the focused window in one shot (no per-char delay).
         try:
-            subprocess.run(["wtype", text], check=True)
+            subprocess.run(["wtype", "--", text], check=True)
             return
         except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
             print(f"[dictate] wtype failed, falling back: {exc}", flush=True)
-            pass
 
-        # Clipboard-paste fallback for Wayland
+        # ydotool type with zero key-delay — fast and reliable if /dev/uinput is accessible.
+        if _can_use_ydotool():
+            try:
+                subprocess.run(["ydotool", "type", "--key-delay", "0", "--", text], check=True)
+                return
+            except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
+                print(f"[dictate] ydotool type failed, falling back: {exc}", flush=True)
+        else:
+            print("[dictate] /dev/uinput not writable; skipping ydotool injection.", flush=True)
+
+        # Clipboard-paste via ydotool key as last resort.
         if copied and _can_use_ydotool():
-            paste_key = "ctrl+shift+v" if is_terminal else "ctrl+v"
             time.sleep(0.2)
             try:
                 subprocess.run(["ydotool", "key", paste_key], check=True)
                 return
             except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
-                print(f"[dictate] ydotool key failed, text left in clipboard: {exc}", flush=True)
-                pass
-
-    # X11/XWayland: clipboard-paste approach.
-    if copied:
-        paste_key = "ctrl+shift+v" if is_terminal else "ctrl+v"
-        time.sleep(0.2)  # ensure hotkey modifiers are fully released before sending paste
-        try:
-            cmd = ["xdotool", "key", "--clearmodifiers"]
-            if window_id:
-                cmd += ["--window", window_id]
-            cmd.append(paste_key)
-            subprocess.run(cmd, check=True)
-            return
-        except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
-            print(f"[dictate] xdotool paste failed, text left in clipboard: {exc}", flush=True)
-            pass
+                print(f"[dictate] ydotool key failed: {exc}", flush=True)
+    else:
+        # X11/XWayland: clipboard-paste targets the specific window — instant and reliable.
+        if copied:
+            time.sleep(0.2)  # ensure hotkey modifiers are fully released before sending paste
+            try:
+                cmd = ["xdotool", "key", "--clearmodifiers"]
+                if window_id:
+                    cmd += ["--window", window_id]
+                cmd.append(paste_key)
+                subprocess.run(cmd, check=True)
+                return
+            except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
+                print(f"[dictate] xdotool paste failed, text left in clipboard: {exc}", flush=True)
 
     if copied:
         key_hint = "Ctrl+Shift+V" if is_terminal else "Ctrl+V"
