@@ -19,6 +19,13 @@ Wayland setup:
 If sounddevice fails to load with a GLIBCXX version error (conda environment
 shadowing the system libstdc++), run with:
   LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 python dictate.py
+
+AMD GPU (ROCm) notes:
+  GPU acceleration uses openai-whisper + PyTorch ROCm 7.2 (torch==2.11.0+rocm7.2).
+  Requires ROCm 7.x; ROCm 6.x does NOT support Strix Halo (Radeon 8060S / gfx1100 APU).
+  If the script falls back to CPU unexpectedly, set ROCR_VISIBLE_DEVICES=0 to force
+  device enumeration, e.g.:
+    ROCR_VISIBLE_DEVICES=0 uv run dictate.py
 """
 
 import os
@@ -31,13 +38,12 @@ import tty
 
 import numpy as np
 import sounddevice as sd
-from faster_whisper import WhisperModel
+import whisper
 from pynput import keyboard
 import subprocess
 
 SAMPLE_RATE = 16000
 WHISPER_MODEL = "small"  # small balances speed and accuracy; use medium for more accuracy
-WHISPER_COMPUTE = "int8"
 
 HOTKEY = frozenset([keyboard.Key.ctrl, keyboard.Key.shift, keyboard.Key.space])
 WAYLAND_CONTROL = os.environ.get("DICTATE_WAYLAND_CONTROL", "auto").lower()
@@ -157,10 +163,14 @@ def type_text(text: str, window_id: str | None = None, is_terminal: bool = False
 # ---------------------------------------------------------------------------
 
 def _get_device() -> str:
+    # On AMD APUs (e.g. Strix Halo / Radeon 8060S), ROCm requires ROCR_VISIBLE_DEVICES=0
+    # to enumerate devices correctly; set it here if not already provided.
+    if "ROCR_VISIBLE_DEVICES" not in os.environ:
+        os.environ["ROCR_VISIBLE_DEVICES"] = "0"
     try:
-        import ctranslate2
-        if ctranslate2.get_cuda_device_count() > 0:
-            return "cuda"
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"  # works for both NVIDIA CUDA and AMD ROCm via HIP
     except Exception:
         pass
     return "cpu"
@@ -168,7 +178,7 @@ def _get_device() -> str:
 
 print(f"[dictate] Loading Whisper {WHISPER_MODEL} model...", flush=True)
 _device = _get_device()
-_model = WhisperModel(WHISPER_MODEL, device=_device, compute_type=WHISPER_COMPUTE)
+_model = whisper.load_model(WHISPER_MODEL, device=_device)
 print(f"[dictate] Ready on {_device}. Hold Ctrl+Shift+Space to dictate.", flush=True)
 
 
@@ -204,8 +214,8 @@ def _transcribe_and_type():
         return
     audio = np.concatenate(chunks).flatten()
     print("\r[dictate] Transcribing...              ", end="", flush=True)
-    segments, _ = _model.transcribe(audio, vad_filter=True)
-    text = " ".join(s.text.strip() for s in segments).strip()
+    result = _model.transcribe(audio, fp16=(_device == "cuda"))
+    text = result["text"].strip()
     if text:
         print(f"\r[dictate] → {text}                     ", flush=True)
         try:

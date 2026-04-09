@@ -83,7 +83,8 @@ If `HF_TOKEN` is not set, transcription still works but speaker labels are omitt
 - `ffmpeg`
 - PulseAudio or PipeWire (with PulseAudio compatibility layer)
 - `wmctrl` or `xdotool` — for Google Meet window detection on X11
-- NVIDIA GPU with 4 GB+ VRAM recommended (CPU fallback supported, but slow)
+- NVIDIA GPU or AMD GPU with ROCm 7.x (CPU fallback supported, but slow)
+  - AMD note: requires PyTorch ROCm 7.2+ (`torch==2.11.0+rocm7.2`). ROCm 6.x does not support Strix Halo APUs (Radeon 8060S / gfx1100). Uses `openai-whisper` + PyTorch instead of `faster-whisper` + ctranslate2.
 
 ```bash
 sudo apt install ffmpeg wmctrl libportaudio2 xdotool
