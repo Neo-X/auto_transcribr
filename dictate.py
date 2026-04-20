@@ -34,6 +34,7 @@ import threading
 import sys
 import select
 import termios
+import traceback
 import tty
 
 import numpy as np
@@ -194,35 +195,43 @@ _combo_latched = False
 
 def _record():
     chunks = []
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32") as stream:
-        while _recording:
-            data, _ = stream.read(1024)
-            chunks.append(data.copy())
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32") as stream:
+            while _recording:
+                data, _ = stream.read(1024)
+                chunks.append(data.copy())
+    except Exception:
+        print("\n[dictate] ERROR in recording thread:", flush=True)
+        traceback.print_exc()
     with _lock:
         _audio_chunks.clear()
         _audio_chunks.extend(chunks)
 
 
 def _transcribe_and_type():
-    with _lock:
-        chunks = list(_audio_chunks)
-    if not chunks:
-        return
-    audio = np.concatenate(chunks).flatten()
-    print("\r[dictate] Transcribing...              ", end="", flush=True)
-    result = _model.transcribe(audio, fp16=(_device == "cuda"))
-    text = result["text"].strip()
-    if text:
-        print(f"\r[dictate] → {text}                     ", flush=True)
-        try:
-            type_text(text, _target_window, _target_is_terminal)
-        except Exception as exc:
-            print(f"[dictate] Typing backend error: {exc}", flush=True)
-            if _set_clipboard(text):
-                print("[dictate] Transcription copied to clipboard.", flush=True)
-    else:
-        print("\r[dictate] No speech detected.          ", flush=True)
-    print("[dictate] Press Ctrl+Shift+Space to toggle dictation.", flush=True)
+    try:
+        with _lock:
+            chunks = list(_audio_chunks)
+        if not chunks:
+            return
+        audio = np.concatenate(chunks).flatten()
+        print("\r[dictate] Transcribing...              ", end="", flush=True)
+        result = _model.transcribe(audio, fp16=(_device == "cuda"))
+        text = result["text"].strip()
+        if text:
+            print(f"\r[dictate] → {text}                     ", flush=True)
+            try:
+                type_text(text, _target_window, _target_is_terminal)
+            except Exception as exc:
+                print(f"[dictate] Typing backend error: {exc}", flush=True)
+                if _set_clipboard(text):
+                    print("[dictate] Transcription copied to clipboard.", flush=True)
+        else:
+            print("\r[dictate] No speech detected.          ", flush=True)
+        print("[dictate] Press Ctrl+Shift+Space to toggle dictation.", flush=True)
+    except Exception:
+        print("\n[dictate] ERROR in transcription thread:", flush=True)
+        traceback.print_exc()
 
 
 def _start_recording():
@@ -271,20 +280,33 @@ def _normalize_key(key):
 
 def on_press(key):
     global _combo_latched
-    if key == keyboard.Key.esc:
-        print("\n[dictate] Exiting.", flush=True)
-        return False  # stops the listener
-    _current_keys.add(_normalize_key(key))
-    if _hotkey_active() and not _combo_latched:
-        _combo_latched = True
-        _toggle_recording(async_transcribe=True)
+    try:
+        if key == keyboard.Key.esc:
+            print("\n[dictate] Exiting.", flush=True)
+            return False  # stops the listener
+        _current_keys.add(_normalize_key(key))
+        if _hotkey_active() and not _combo_latched:
+            _combo_latched = True
+            _toggle_recording(async_transcribe=True)
+    except Exception:
+        print("\n[dictate] ERROR in on_press callback:", flush=True)
+        traceback.print_exc()
 
 
 def on_release(key):
     global _combo_latched
-    _current_keys.discard(_normalize_key(key))
-    if not _hotkey_active():
-        _combo_latched = False
+    try:
+        _current_keys.discard(_normalize_key(key))
+        if not _hotkey_active():
+            _combo_latched = False
+    except Exception:
+        print("\n[dictate] ERROR in on_release callback:", flush=True)
+        traceback.print_exc()
+
+
+def _on_listener_error(exc):
+    print("\n[dictate] ERROR in keyboard listener thread:", flush=True)
+    traceback.print_exception(type(exc), exc, exc.__traceback__)
 
 
 def _run_wayland_evdev_hotkey_listener():
@@ -451,9 +473,25 @@ def main():
         print("[dictate] Wayland pynput mode: Ctrl+Shift+Space toggles (may not work on many compositors).", flush=True)
     else:
         print("[dictate] Hotkey mode: Ctrl+Shift+Space toggles dictation (Esc quits).", flush=True)
-    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:  # type: ignore[arg-type]
-        listener.join()
+    try:
+        with keyboard.Listener(  # type: ignore[arg-type]
+            on_press=on_press,
+            on_release=on_release,
+            on_error=_on_listener_error,
+        ) as listener:
+            listener.join()
+        print("\n[dictate] Keyboard listener stopped.", flush=True)
+    except Exception:
+        print("\n[dictate] ERROR in keyboard listener:", flush=True)
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[dictate] Interrupted by user (Ctrl+C).", flush=True)
+    except Exception:
+        print("\n[dictate] FATAL ERROR:", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
