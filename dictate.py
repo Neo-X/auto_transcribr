@@ -33,15 +33,47 @@ import time
 import threading
 import sys
 import select
+import signal
+import faulthandler
 import termios
 import traceback
 import tty
+import atexit
 
 import numpy as np
 import sounddevice as sd
 import whisper
 from pynput import keyboard
 import subprocess
+
+_LOG_PATH = os.path.expanduser("~/.cache/dictate.log")
+_log_file = open(_LOG_PATH, "a", buffering=1)
+
+
+def _log(msg: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    print(line, file=_log_file, flush=True)
+
+
+# Dump segfault tracebacks to the log file.
+faulthandler.enable(file=_log_file, all_threads=True)
+
+
+def _signal_handler(signum, frame):
+    _log(f"Received signal {signum} ({signal.Signals(signum).name}); exiting.")
+    traceback.print_stack(frame, file=_log_file)
+    _log_file.flush()
+    sys.exit(0)
+
+
+for _sig in (signal.SIGTERM, signal.SIGHUP):
+    signal.signal(_sig, _signal_handler)
+# SIGINT is left as default (raises KeyboardInterrupt) so genuine Ctrl+C still works.
+
+atexit.register(lambda: _log("Process exiting via atexit."))
+
 
 SAMPLE_RATE = 16000
 WHISPER_MODEL = "small"  # small balances speed and accuracy; use medium for more accuracy
@@ -173,10 +205,10 @@ def _get_device() -> str:
     return "cpu"
 
 
-print(f"[dictate] Loading Whisper {WHISPER_MODEL} model...", flush=True)
+_log(f"[dictate] Loading Whisper {WHISPER_MODEL} model...")
 _device = _get_device()
 _model = whisper.load_model(WHISPER_MODEL, device=_device)
-print(f"[dictate] Ready on {_device}. Hold Ctrl+Shift+Space to dictate.", flush=True)
+_log(f"[dictate] Ready on {_device}. Hold Ctrl+Shift+Space to dictate.")
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +233,8 @@ def _record():
                 data, _ = stream.read(1024)
                 chunks.append(data.copy())
     except Exception:
-        print("\n[dictate] ERROR in recording thread:", flush=True)
+        _log("[dictate] ERROR in recording thread:")
+        traceback.print_exc(file=_log_file)
         traceback.print_exc()
     with _lock:
         _audio_chunks.clear()
@@ -281,31 +314,34 @@ def _normalize_key(key):
 def on_press(key):
     global _combo_latched
     try:
-        if key == keyboard.Key.esc:
-            print("\n[dictate] Exiting.", flush=True)
-            return False  # stops the listener
+        _log(f"[key] press: {key!r}  active_keys={set(_current_keys) | {_normalize_key(key)}}")
         _current_keys.add(_normalize_key(key))
         if _hotkey_active() and not _combo_latched:
             _combo_latched = True
+            _log("[dictate] Hotkey triggered → toggling recording.")
             _toggle_recording(async_transcribe=True)
     except Exception:
-        print("\n[dictate] ERROR in on_press callback:", flush=True)
+        _log("[dictate] ERROR in on_press callback:")
+        traceback.print_exc(file=_log_file)
         traceback.print_exc()
 
 
 def on_release(key):
     global _combo_latched
     try:
+        _log(f"[key] release: {key!r}  active_keys={_current_keys - {_normalize_key(key)}}")
         _current_keys.discard(_normalize_key(key))
         if not _hotkey_active():
             _combo_latched = False
     except Exception:
-        print("\n[dictate] ERROR in on_release callback:", flush=True)
+        _log("[dictate] ERROR in on_release callback:")
+        traceback.print_exc(file=_log_file)
         traceback.print_exc()
 
 
 def _on_listener_error(exc):
-    print("\n[dictate] ERROR in keyboard listener thread:", flush=True)
+    _log("[dictate] ERROR in keyboard listener thread:")
+    traceback.print_exception(type(exc), exc, exc.__traceback__, file=_log_file)
     traceback.print_exception(type(exc), exc, exc.__traceback__)
 
 
@@ -323,7 +359,6 @@ def _run_wayland_evdev_hotkey_listener():
         ecodes.KEY_LEFTSHIFT: "shift",
         ecodes.KEY_RIGHTSHIFT: "shift",
         ecodes.KEY_SPACE: "space",
-        ecodes.KEY_ESC: "esc",
     }
 
     devices = []
@@ -359,7 +394,7 @@ def _run_wayland_evdev_hotkey_listener():
             print("[dictate] No readable input devices found for evdev.", flush=True)
         return False
 
-    print("[dictate] Wayland global hotkey mode (evdev): Ctrl+Shift+Space toggles, Esc quits.", flush=True)
+    print("[dictate] Wayland global hotkey mode (evdev): Ctrl+Shift+Space toggles, Ctrl+C quits.", flush=True)
     pressed: set[str] = set()
     combo_latched = False
 
@@ -378,11 +413,8 @@ def _run_wayland_evdev_hotkey_listener():
                     if not token:
                         continue
 
-                    if token == "esc" and event.value == 1:
-                        print("\n[dictate] Exiting.", flush=True)
-                        if _recording:
-                            _stop_recording(async_transcribe=False)
-                        return True
+                    action = {1: "press", 2: "repeat", 0: "release"}.get(event.value, str(event.value))
+                    _log(f"[key/evdev] {action}: code={event.code} token={token!r}  pressed={pressed | ({token} if event.value in (1,2) else set())}")
 
                     if event.value in (1, 2):
                         pressed.add(token)
@@ -392,6 +424,7 @@ def _run_wayland_evdev_hotkey_listener():
                     combo_active = hotkey_tokens.issubset(pressed)
                     if combo_active and not combo_latched:
                         combo_latched = True
+                        _log("[dictate] Hotkey triggered via evdev → toggling recording.")
                         _toggle_recording(async_transcribe=True)
                     elif not combo_active:
                         combo_latched = False
@@ -417,9 +450,8 @@ _BANNER = """
 ┌─────────────────────────────────────────┐
 │              dictate.py                 │
 ├─────────────────────────────────────────┤
-│  Press Ctrl+Shift+Space → toggle record │
-│  Press Esc              → quit          │
-│  Ctrl+C                →  quit          │
+│  Ctrl+Shift+Space → toggle record       │
+│  Ctrl+C           → quit               │
 └─────────────────────────────────────────┘
 """
 
@@ -480,18 +512,26 @@ def main():
             on_error=_on_listener_error,
         ) as listener:
             listener.join()
-        print("\n[dictate] Keyboard listener stopped.", flush=True)
+        _log("[dictate] Keyboard listener stopped (join returned).")
     except Exception:
-        print("\n[dictate] ERROR in keyboard listener:", flush=True)
+        _log("[dictate] ERROR in keyboard listener:")
+        traceback.print_exc(file=_log_file)
         traceback.print_exc()
 
 
 if __name__ == "__main__":
+    _log(f"[dictate] Started. PID={os.getpid()}")
     try:
         main()
+        _log("[dictate] main() returned normally.")
     except KeyboardInterrupt:
-        print("\n[dictate] Interrupted by user (Ctrl+C).", flush=True)
+        import traceback as _tb
+        _log("[dictate] KeyboardInterrupt (SIGINT) received. Stack at interrupt:")
+        _tb.print_stack(file=_log_file)
+        _log_file.flush()
+        print("\n[dictate] Interrupted (Ctrl+C).", flush=True)
     except Exception:
-        print("\n[dictate] FATAL ERROR:", flush=True)
+        _log("[dictate] FATAL ERROR:")
+        traceback.print_exc(file=_log_file)
         traceback.print_exc()
         sys.exit(1)
