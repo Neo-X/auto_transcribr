@@ -155,8 +155,6 @@ def type_text(text: str, window_id: str | None = None, is_terminal: bool = False
                 return
             except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
                 print(f"[dictate] ydotool type failed, falling back: {exc}", flush=True)
-        else:
-            print("[dictate] /dev/uinput not writable; skipping ydotool injection.", flush=True)
 
         # Clipboard-paste via ydotool key as last resort.
         if copied and _can_use_ydotool():
@@ -261,7 +259,6 @@ def _transcribe_and_type():
                     print("[dictate] Transcription copied to clipboard.", flush=True)
         else:
             print("\r[dictate] No speech detected.          ", flush=True)
-        print("[dictate] Press Ctrl+Shift+Space to toggle dictation.", flush=True)
     except Exception:
         print("\n[dictate] ERROR in transcription thread:", flush=True)
         traceback.print_exc()
@@ -385,13 +382,9 @@ def _run_wayland_evdev_hotkey_listener():
 
     if not devices:
         if permission_denied > 0:
-            print("[dictate] evdev permission denied for /dev/input/event*.", flush=True)
-            print("[dictate] Add user to input group and re-login: sudo usermod -aG input $USER", flush=True)
-            print("[dictate] Temporary workaround for this shell: newgrp input", flush=True)
-        elif open_errors > 0:
-            print("[dictate] evdev could not open input devices.", flush=True)
+            print("[dictate] evdev: permission denied. Run: sudo usermod -aG input $USER  (or: newgrp input)", flush=True)
         else:
-            print("[dictate] No readable input devices found for evdev.", flush=True)
+            print("[dictate] evdev: no readable input devices found.", flush=True)
         return False
 
     print("[dictate] Wayland global hotkey mode (evdev): Ctrl+Shift+Space toggles, Ctrl+C quits.", flush=True)

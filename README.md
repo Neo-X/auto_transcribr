@@ -76,6 +76,81 @@ uv run monitor.py
 
 If `HF_TOKEN` is not set, transcription still works but speaker labels are omitted.
 
+## dictate.py — Real-time Voice Dictation
+
+`dictate.py` listens for a hotkey, records your voice, transcribes it with Whisper, and types the result into whatever window is focused. It works on X11 and Wayland.
+
+**Hotkey:** `Ctrl+Shift+Space` — press once to start recording, press again to stop and transcribe.
+
+### Quick start
+
+```bash
+uv run dictate.py
+```
+
+Run it in a **dedicated terminal** and dictate into any other window. Do not dictate into the terminal running the script — the paste will land in the shell, producing `^[[200~` garbage.
+
+### Setup
+
+Install system dependencies:
+
+```bash
+# X11
+sudo apt install libportaudio2 xdotool xclip
+
+# Wayland (in addition to the above)
+sudo apt install wtype wl-clipboard ydotool
+```
+
+For global hotkeys on Wayland (recommended), grant `evdev` access:
+
+```bash
+uv add evdev
+sudo usermod -aG input $USER
+# log out and back in, or run: newgrp input
+```
+
+### How text is typed
+
+After transcription, the result is injected into the previously focused window. Backends are tried in order:
+
+| Backend | When used |
+|---------|-----------|
+| `wtype` | Wayland — direct virtual keyboard injection |
+| `ydotool` | Wayland fallback — requires writable `/dev/uinput` |
+| `xdotool` + clipboard | X11 / XWayland |
+| Clipboard only | All else fails — paste manually with `Ctrl+Shift+V` / `Ctrl+V` |
+
+### Wayland hotkey modes
+
+On Wayland, `dictate.py` defaults to `auto` mode, trying `evdev` first and falling back to terminal mode:
+
+```bash
+DICTATE_WAYLAND_CONTROL=auto      uv run dictate.py  # default
+DICTATE_WAYLAND_CONTROL=evdev     uv run dictate.py  # global hotkey (requires input group)
+DICTATE_WAYLAND_CONTROL=terminal  uv run dictate.py  # Enter toggles in the terminal
+DICTATE_WAYLAND_CONTROL=pynput    uv run dictate.py  # may not work on most compositors
+```
+
+### AMD GPU (ROCm)
+
+ROCm 7.x is required (ROCm 6.x does not support Strix Halo / gfx1100). If the device falls back to CPU unexpectedly:
+
+```bash
+ROCR_VISIBLE_DEVICES=0 uv run dictate.py
+```
+
+### Troubleshooting
+
+- **`GLIBCXX` error in conda** — conda's `libstdc++` is older than required; preload the system one:
+  ```bash
+  LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 uv run dictate.py
+  ```
+- **evdev permission denied** — run `newgrp input` or log out and back in after `usermod -aG input`.
+- **wtype error "compositor does not support virtual keyboard protocol"** — use `ydotool` or set `DICTATE_WAYLAND_CONTROL=terminal`.
+
+---
+
 ## Requirements
 
 - Python 3.13+
@@ -89,90 +164,6 @@ If `HF_TOKEN` is not set, transcription still works but speaker labels are omitt
 ```bash
 sudo apt install ffmpeg wmctrl libportaudio2 xdotool
 ```
-
-For Wayland, install `wtype` instead of (or in addition to) `xdotool`:
-```bash
-sudo apt install wtype
-```
-
-### dictate.py additional requirements
-
-`dictate.py` requires `libportaudio2` for microphone input and `xdotool` (X11) or `wtype` (Wayland) to type transcribed text into the focused window. Also install `xclip` for clipboard support:
-
-```bash
-sudo apt install xclip
-```
-
-For better Wayland support, also install:
-
-```bash
-sudo apt install wl-clipboard ydotool
-```
-
-For global hotkeys on Wayland, install and allow `evdev` access:
-
-```bash
-uv add evdev
-sudo usermod -aG input $USER
-# log out and back in after adding the group
-```
-
-**Usage notes:**
-
-- Run `dictate.py` in a **dedicated terminal**. Do not try to dictate into the terminal running the script — the Python process will receive the paste instead of the shell, producing `^[[200~` garbage.
-- The transcribed text is automatically copied to the clipboard. If auto-paste does not work, paste manually with `Ctrl+Shift+V` (terminal) or `Ctrl+V` (browser).
-- The active window is captured at the moment you press the hotkey, so focus does not need to remain on the target during transcription.
-- If you see a `GLIBCXX` version error when running in a conda environment (conda's `libstdc++` is older than what `libjack` requires), preload the system library:
-
-```bash
-LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 python dictate.py
-```
-
-### Dictation typing backends
-
-`dictate.py` now supports multiple output backends and tries them in order:
-
-1. `wtype` (Wayland virtual keyboard protocol)
-2. `ydotool` (uinput-based keyboard injection)
-3. clipboard + `xdotool` paste
-4. clipboard only (manual paste)
-
-Override backend selection with:
-
-```bash
-DICTATE_TYPE_BACKEND=auto    uv run dictate.py
-DICTATE_TYPE_BACKEND=wtype   uv run dictate.py
-DICTATE_TYPE_BACKEND=ydotool uv run dictate.py
-DICTATE_TYPE_BACKEND=xdotool uv run dictate.py
-```
-
-If your compositor does not support the virtual keyboard protocol, `wtype` will fail with an error like "Compositor does not support the virtual keyboard protocol". In that case, use `ydotool` or fall back to clipboard paste.
-
-### Wayland recording controls
-
-`dictate.py` uses **toggle recording**: press `Ctrl+Shift+Space` once to start, press again to stop and transcribe.
-
-On Wayland, `dictate.py` defaults to `auto` mode:
-- Try global hotkeys with `evdev` first (works across applications if input permissions are available)
-- Fall back to terminal mode when unavailable
-
-Force specific mode with `DICTATE_WAYLAND_CONTROL`:
-
-```bash
-DICTATE_WAYLAND_CONTROL=auto    uv run dictate.py
-DICTATE_WAYLAND_CONTROL=evdev   uv run dictate.py
-DICTATE_WAYLAND_CONTROL=pynput  uv run dictate.py
-DICTATE_WAYLAND_CONTROL=terminal uv run dictate.py
-```
-
-Mode notes:
-- `evdev`: best option for global hotkeys on Wayland; requires access to `/dev/input/event*`
-- `pynput`: can work on X11; often blocked on Wayland compositors
-- `terminal`: Enter toggles recording in the terminal window
-
-If you added yourself to the `input` group recently, start a new login session (or run `newgrp input` in the current shell) before starting `dictate.py`.
-
-For auto-typing with `ydotool`, `/dev/uinput` must also be writable by your user (or by a group your user is in). If `dictate.py` logs `/dev/uinput not writable`, typing injection is blocked by system permissions; dictation will still copy text to clipboard for manual paste.
 
 ## Installation & Usage
 
