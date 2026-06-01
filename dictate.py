@@ -311,7 +311,6 @@ def _normalize_key(key):
 def on_press(key):
     global _combo_latched
     try:
-        _log(f"[key] press: {key!r}  active_keys={set(_current_keys) | {_normalize_key(key)}}")
         _current_keys.add(_normalize_key(key))
         if _hotkey_active() and not _combo_latched:
             _combo_latched = True
@@ -326,7 +325,6 @@ def on_press(key):
 def on_release(key):
     global _combo_latched
     try:
-        _log(f"[key] release: {key!r}  active_keys={_current_keys - {_normalize_key(key)}}")
         _current_keys.discard(_normalize_key(key))
         if not _hotkey_active():
             _combo_latched = False
@@ -405,9 +403,6 @@ def _run_wayland_evdev_hotkey_listener():
                     token = key_map.get(event.code)
                     if not token:
                         continue
-
-                    action = {1: "press", 2: "repeat", 0: "release"}.get(event.value, str(event.value))
-                    _log(f"[key/evdev] {action}: code={event.code} token={token!r}  pressed={pressed | ({token} if event.value in (1,2) else set())}")
 
                     if event.value in (1, 2):
                         pressed.add(token)
