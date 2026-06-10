@@ -76,7 +76,7 @@ atexit.register(lambda: _log("Process exiting via atexit."))
 
 
 SAMPLE_RATE = 16000
-WHISPER_MODEL = "small"  # small balances speed and accuracy; use medium for more accuracy
+WHISPER_MODEL = "turbo"  # large-v3-turbo: near large-v3 accuracy at ~8x speed; "medium"/"small" are lighter fallbacks
 
 HOTKEY = frozenset([keyboard.Key.ctrl, keyboard.Key.shift, keyboard.Key.space])
 WAYLAND_CONTROL = os.environ.get("DICTATE_WAYLAND_CONTROL", "auto").lower()
