@@ -87,7 +87,9 @@ WAYLAND_CONTROL = os.environ.get("DICTATE_WAYLAND_CONTROL", "auto").lower()
 # ---------------------------------------------------------------------------
 
 _TERMINAL_CLASSES = {"gnome-terminal", "konsole", "xterm", "urxvt", "alacritty",
-                     "kitty", "tilix", "terminator", "st", "rxvt", "xfce4-terminal"}
+                     "kitty", "tilix", "terminator", "st", "rxvt", "xfce4-terminal",
+                     "foot", "wezterm", "ghostty", "terminology", "deepin-terminal",
+                     "lxterminal", "mate-terminal", "terminal", "guake", "tilda"}
 
 
 def _get_active_window() -> tuple[str | None, bool]:
@@ -165,15 +167,25 @@ def type_text(text: str, window_id: str | None = None, is_terminal: bool = False
             except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
                 print(f"[dictate] ydotool key failed: {exc}", flush=True)
     else:
-        # X11/XWayland: clipboard-paste targets the specific window — instant and reliable.
+        # X11/XWayland: clipboard-paste into the currently focused window.
+        #
+        # Deliberately NOT using `xdotool key --window <id>`: that sends a synthetic
+        # XSendEvent targeted at a specific window, which GTK/GNOME apps (gnome-terminal,
+        # xfce4-terminal, nautilus, etc.) silently ignore for security reasons — the paste
+        # would appear to succeed but nothing would happen. Plain `xdotool key` uses XTEST
+        # (a fake hardware event delivered to whatever currently has focus), which every
+        # app accepts. This assumes focus hasn't moved away from the target window since
+        # recording started, which holds for the normal hold-hotkey-and-speak workflow.
+        if window_id:
+            try:
+                subprocess.run(["xdotool", "windowactivate", "--sync", window_id],
+                               capture_output=True, check=False)
+            except (FileNotFoundError, subprocess.SubprocessError, OSError):
+                pass
         if copied:
             time.sleep(0.2)  # ensure hotkey modifiers are fully released before sending paste
             try:
-                cmd = ["xdotool", "key", "--clearmodifiers"]
-                if window_id:
-                    cmd += ["--window", window_id]
-                cmd.append(paste_key)
-                subprocess.run(cmd, check=True)
+                subprocess.run(["xdotool", "key", "--clearmodifiers", paste_key], check=True)
                 return
             except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
                 print(f"[dictate] xdotool paste failed, text left in clipboard: {exc}", flush=True)
