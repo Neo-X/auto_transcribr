@@ -78,6 +78,15 @@ atexit.register(lambda: _log("Process exiting via atexit."))
 SAMPLE_RATE = 16000
 WHISPER_MODEL = "turbo"  # large-v3-turbo: near large-v3 accuracy at ~8x speed; "medium"/"small" are lighter fallbacks
 
+# Whisper defaults to American spelling. Seeding the decoder with an initial_prompt
+# written in British English biases it to continue in the same style/spelling
+# (there's no dedicated "dialect" flag — this prompt-conditioning trick is the
+# standard workaround).
+WHISPER_INITIAL_PROMPT = (
+    "Transcribed in British/Canadian English: colour, favourite, organise, realise, "
+    "centre, behaviour, analyse, travelling, licence."
+)
+
 HOTKEY = frozenset([keyboard.Key.ctrl, keyboard.Key.shift, keyboard.Key.space])
 WAYLAND_CONTROL = os.environ.get("DICTATE_WAYLAND_CONTROL", "auto").lower()
 
@@ -150,22 +159,27 @@ def type_text(text: str, window_id: str | None = None, is_terminal: bool = False
         except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
             print(f"[dictate] wtype failed, falling back: {exc}", flush=True)
 
-        # ydotool type with zero key-delay — fast and reliable if /dev/uinput is accessible.
-        if _can_use_ydotool():
-            try:
-                subprocess.run(["ydotool", "type", "--key-delay", "0", "--", text], check=True)
-                return
-            except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
-                print(f"[dictate] ydotool type failed, falling back: {exc}", flush=True)
-
-        # Clipboard-paste via ydotool key as last resort.
+        # Clipboard-paste via ydotool key: one synthetic paste event for the whole
+        # text, so it can't drop characters the way per-key injection can. Preferred
+        # over `ydotool type` below, which sends one synthetic keystroke per character
+        # and has been observed to silently drop characters (partial paste) when kernel/
+        # uinput event timing changes — e.g. after a kernel update — outpaces what the
+        # focused app's input handling can keep up with.
         if copied and _can_use_ydotool():
             time.sleep(0.2)
             try:
                 subprocess.run(["ydotool", "key", paste_key], check=True)
                 return
             except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
-                print(f"[dictate] ydotool key failed: {exc}", flush=True)
+                print(f"[dictate] ydotool key failed, falling back: {exc}", flush=True)
+
+        # ydotool type as last resort (per-character synthetic keystrokes — see note above).
+        if _can_use_ydotool():
+            try:
+                subprocess.run(["ydotool", "type", "--key-delay", "8", "--", text], check=True)
+                return
+            except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
+                print(f"[dictate] ydotool type failed: {exc}", flush=True)
     else:
         # X11/XWayland: clipboard-paste into the currently focused window.
         #
@@ -259,7 +273,7 @@ def _transcribe_and_type():
             return
         audio = np.concatenate(chunks).flatten()
         print("\r[dictate] Transcribing...              ", end="", flush=True)
-        result = _model.transcribe(audio, fp16=(_device == "cuda"))
+        result = _model.transcribe(audio, fp16=(_device == "cuda"), initial_prompt=WHISPER_INITIAL_PROMPT)
         text = result["text"].strip()
         if text:
             print(f"\r[dictate] → {text}                     ", flush=True)
