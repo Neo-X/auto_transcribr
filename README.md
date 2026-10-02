@@ -60,6 +60,8 @@ Models are downloaded automatically from Hugging Face on first use and cached in
 
 To change the model, edit `WHISPER_MODEL` and `WHISPER_COMPUTE` at the top of `monitor.py`.
 
+**Newer models to try:** see Gladia's roundup of [the best open-source speech-to-text models](https://www.gladia.io/blog/best-open-source-speech-to-text-models) for candidate alternatives to Whisper.
+
 ## Speaker Diarization Setup
 
 Diarization requires a free [Hugging Face](https://huggingface.co) account and accepting the terms for two models:
