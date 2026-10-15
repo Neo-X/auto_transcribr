@@ -382,28 +382,54 @@ def _run_wayland_evdev_hotkey_listener():
         ecodes.KEY_SPACE: "space",
     }
 
-    devices = []
-    permission_denied = 0
-    open_errors = 0
-    for path in list_devices():
-        try:
-            dev = InputDevice(path)
-            caps = dev.capabilities().get(ecodes.EV_KEY, [])
-            key_codes = set()
-            for item in caps:
-                if isinstance(item, tuple):
-                    key_codes.add(item[0])
-                else:
-                    key_codes.add(item)
-            if any(code in key_codes for code in key_map):
-                devices.append(dev)
-        except PermissionError:
-            permission_denied += 1
-            continue
-        except Exception:
-            open_errors += 1
-            continue
+    # Keyboards are tracked by device path. The set is rescanned periodically so
+    # keyboards plugged in (or wireless keyboards reconnecting after sleep, which
+    # come back as a new /dev/input/event* node) after startup are picked up, and
+    # ones that disappear are dropped instead of crashing the listener.
+    RESCAN_INTERVAL = 300.0  # seconds
+    devices: dict[str, "InputDevice"] = {}
+    # Per-device pressed keys, so a keyboard unplugged mid-press can't leave a
+    # modifier stuck down.
+    pressed: dict[str, set[str]] = {}
+    ignored_paths: set[str] = set()
 
+    def _scan() -> int:
+        permission_denied = 0
+        for path in list_devices():
+            if path in devices or path in ignored_paths:
+                continue
+            try:
+                dev = InputDevice(path)
+            except PermissionError:
+                permission_denied += 1
+                continue
+            except Exception:
+                continue
+            try:
+                caps = dev.capabilities().get(ecodes.EV_KEY, [])
+                key_codes = {item[0] if isinstance(item, tuple) else item for item in caps}
+            except Exception:
+                key_codes = set()
+            if ecodes.KEY_SPACE in key_codes:
+                devices[path] = dev
+                pressed[path] = set()
+                _log(f"[dictate] evdev: listening on {dev.name} ({path})")
+            else:
+                ignored_paths.add(path)
+                dev.close()
+        return permission_denied
+
+    def _drop(path: str):
+        dev = devices.pop(path, None)
+        pressed.pop(path, None)
+        if dev is not None:
+            _log(f"[dictate] evdev: device removed: {dev.name} ({path})")
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+    permission_denied = _scan()
     if not devices:
         if permission_denied > 0:
             print("[dictate] evdev: permission denied. Run: sudo usermod -aG input $USER  (or: newgrp input)", flush=True)
@@ -412,17 +438,42 @@ def _run_wayland_evdev_hotkey_listener():
         return False
 
     print("[dictate] Wayland global hotkey mode (evdev): Ctrl+Shift+Space toggles, Ctrl+C quits.", flush=True)
-    pressed: set[str] = set()
     combo_latched = False
+    last_scan = time.monotonic()
 
     try:
         while True:
-            ready, _, _ = select.select(devices, [], [], 0.2)
-            if not ready:
+            now = time.monotonic()
+            if now - last_scan >= RESCAN_INTERVAL:
+                last_scan = now
+                # Forget ignored paths that no longer exist so a reused node number
+                # gets re-checked, then pick up any new keyboards.
+                existing = set(list_devices())
+                ignored_paths.intersection_update(existing)
+                for path in [p for p in devices if p not in existing]:
+                    _drop(path)
+                _scan()
+
+            if not devices:
+                time.sleep(0.2)
+                continue
+
+            try:
+                ready, _, _ = select.select(list(devices.values()), [], [], 0.2)
+            except (OSError, ValueError):
+                # A device fd went bad between rescans; force a rescan.
+                last_scan = 0.0
                 continue
 
             for dev in ready:
-                for event in dev.read():
+                path = dev.path
+                try:
+                    events = list(dev.read())
+                except OSError:
+                    _drop(path)
+                    continue
+
+                for event in events:
                     if event.type != ecodes.EV_KEY:
                         continue
 
@@ -431,16 +482,16 @@ def _run_wayland_evdev_hotkey_listener():
                         continue
 
                     if event.value in (1, 2):
-                        pressed.add(token)
+                        pressed[path].add(token)
                     elif event.value == 0:
-                        pressed.discard(token)
+                        pressed[path].discard(token)
 
-                    combo_active = hotkey_tokens.issubset(pressed)
+                    combo_active = hotkey_tokens.issubset(pressed[path])
                     if combo_active and not combo_latched:
                         combo_latched = True
-                        _log("[dictate] Hotkey triggered via evdev → toggling recording.")
+                        _log(f"[dictate] Hotkey triggered via evdev ({dev.name}) → toggling recording.")
                         _toggle_recording(async_transcribe=True)
-                    elif not combo_active:
+                    elif not any(hotkey_tokens.issubset(keys) for keys in pressed.values()):
                         combo_latched = False
     except PermissionError:
         print("[dictate] No permission to read /dev/input/event*. Add user to input group and re-login.", flush=True)
@@ -449,7 +500,7 @@ def _run_wayland_evdev_hotkey_listener():
         print(f"[dictate] evdev listener failed: {exc}", flush=True)
         return False
     finally:
-        for dev in devices:
+        for dev in devices.values():
             try:
                 dev.close()
             except Exception:
