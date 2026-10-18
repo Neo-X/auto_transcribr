@@ -29,8 +29,10 @@ AMD GPU (ROCm) notes:
 """
 
 import os
+import json
 import time
 import threading
+import wave
 import sys
 import select
 import signal
@@ -40,9 +42,10 @@ import traceback
 import tty
 import atexit
 
+import argparse
+
 import numpy as np
 import sounddevice as sd
-import whisper
 from pynput import keyboard
 import subprocess
 
@@ -78,6 +81,27 @@ atexit.register(lambda: _log("Process exiting via atexit."))
 SAMPLE_RATE = 16000
 WHISPER_MODEL = "turbo"  # large-v3-turbo: near large-v3 accuracy at ~8x speed; "medium"/"small" are lighter fallbacks
 
+# Selectable speech-to-text models (--model / DICTATE_MODEL). All are open weights
+# and run locally; the HF ones are downloaded on first use.
+#   whisper  openai-whisper large-v3-turbo (809M) — the original default
+#   granite  IBM Granite Speech 4.1 2B — supports keyword biasing (--keywords)
+#   cohere   Cohere Transcribe 03-2026 (2B) — gated on Hugging Face: accept the
+#            terms on its model page and run `hf auth login` once before using it
+MODELS = {
+    "whisper": f"openai-whisper/{WHISPER_MODEL}",
+    "granite": "ibm-granite/granite-speech-4.1-2b",
+    "cohere": "CohereLabs/cohere-transcribe-03-2026",
+}
+
+_parser = argparse.ArgumentParser(description="Hold-to-dictate voice typing")
+_parser.add_argument("--model", choices=sorted(MODELS), default=os.environ.get("DICTATE_MODEL", "whisper"),
+                     help="Speech-to-text model (default: $DICTATE_MODEL or whisper)")
+_parser.add_argument("--keywords", default=os.environ.get("DICTATE_KEYWORDS", ""),
+                     help="granite: comma-separated words to bias towards, e.g. 'Asana, RLC, LoRA'")
+_args, _ = _parser.parse_known_args()
+MODEL = _args.model
+KEYWORDS = _args.keywords.strip()
+
 # Whisper defaults to American spelling. Seeding the decoder with an initial_prompt
 # written in British English biases it to continue in the same style/spelling
 # (there's no dedicated "dialect" flag — this prompt-conditioning trick is the
@@ -88,6 +112,15 @@ WHISPER_INITIAL_PROMPT = (
 )
 
 HOTKEY = frozenset([keyboard.Key.ctrl, keyboard.Key.shift, keyboard.Key.space])
+
+# Every dictation is saved (WAV + a line in metadata.jsonl) so clips can later be
+# reviewed and the interesting ones — especially failures — promoted into a
+# validation/training set. The directory is in /tmp on purpose: it is a staging
+# area that gets wiped on reboot, not the permanent dataset. Layout follows the
+# Hugging Face "audiofolder" format: load_dataset("audiofolder", data_dir=...).
+# Set DICTATE_SAVE_AUDIO=0 to disable.
+SAVE_AUDIO = os.environ.get("DICTATE_SAVE_AUDIO", "1") != "0"
+SAVE_DIR = os.path.expanduser(os.environ.get("DICTATE_SAVE_DIR", "/tmp/dictate-clips"))
 WAYLAND_CONTROL = os.environ.get("DICTATE_WAYLAND_CONTROL", "auto").lower()
 
 
@@ -229,9 +262,82 @@ def _get_device() -> str:
     return "cpu"
 
 
-_log(f"[dictate] Loading Whisper {WHISPER_MODEL} model...")
+def _load_whisper(device: str):
+    import whisper
+
+    model = whisper.load_model(WHISPER_MODEL, device=device)
+
+    def transcribe(audio: np.ndarray) -> str:
+        result = model.transcribe(audio, fp16=(device == "cuda"), initial_prompt=WHISPER_INITIAL_PROMPT)
+        return result["text"].strip()
+
+    return transcribe
+
+
+def _load_granite(device: str):
+    import torch
+    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(MODELS["granite"])
+    tokenizer = processor.tokenizer
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(
+        MODELS["granite"], device_map=device, dtype=torch.bfloat16
+    ).eval()
+
+    instruction = "<|audio|>transcribe the speech with proper punctuation and capitalization."
+    if KEYWORDS:
+        instruction += f" Keywords: {KEYWORDS}"
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": instruction}], tokenize=False, add_generation_prompt=True
+    )
+
+    def transcribe(audio: np.ndarray) -> str:
+        wav = torch.from_numpy(audio).float().unsqueeze(0)
+        inputs = processor(prompt, wav, device=device, return_tensors="pt").to(device)
+        # Leave room for fast speech: ~4 tokens per second of audio, at least 200.
+        max_new_tokens = max(200, int(4 * len(audio) / SAMPLE_RATE))
+        with torch.no_grad():
+            ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, num_beams=1)
+        new_tokens = ids[:, inputs["input_ids"].shape[-1]:]
+        return tokenizer.batch_decode(new_tokens, add_special_tokens=False, skip_special_tokens=True)[0].strip()
+
+    return transcribe
+
+
+def _load_cohere(device: str):
+    import torch
+    from transformers import AutoProcessor, CohereAsrForConditionalGeneration
+
+    processor = AutoProcessor.from_pretrained(MODELS["cohere"])
+    model = CohereAsrForConditionalGeneration.from_pretrained(MODELS["cohere"], device_map=device).eval()
+
+    def transcribe(audio: np.ndarray) -> str:
+        # The processor splits long audio into chunks; audio_chunk_index stitches them back.
+        inputs = processor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt", language="en")
+        audio_chunk_index = inputs.get("audio_chunk_index")
+        inputs.to(model.device, dtype=model.dtype)
+        max_new_tokens = max(256, int(4 * len(audio) / SAMPLE_RATE))
+        with torch.no_grad():
+            ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+        text = processor.decode(ids, skip_special_tokens=True, audio_chunk_index=audio_chunk_index, language="en")
+        if isinstance(text, list):
+            text = text[0]
+        return text.strip()
+
+    return transcribe
+
+
+_LOADERS = {"whisper": _load_whisper, "granite": _load_granite, "cohere": _load_cohere}
+
+_log(f"[dictate] Loading {MODEL} ({MODELS[MODEL]})" + (f", keywords: {KEYWORDS}" if MODEL == "granite" and KEYWORDS else "") + "...")
 _device = _get_device()
-_model = whisper.load_model(WHISPER_MODEL, device=_device)
+try:
+    _transcribe = _LOADERS[MODEL](_device)
+except OSError as exc:
+    if "gated" in str(exc).lower():
+        _log(f"[dictate] {MODELS[MODEL]} is gated: accept its terms at https://huggingface.co/{MODELS[MODEL]} "
+             "and run `hf auth login`, then restart.")
+    raise
 _log(f"[dictate] Ready on {_device}. Hold Ctrl+Shift+Space to dictate.")
 
 
@@ -265,6 +371,52 @@ def _record():
         _audio_chunks.extend(chunks)
 
 
+def _save_clip(audio: np.ndarray) -> str | None:
+    """Write the clip as 16-bit mono WAV under SAVE_DIR/clips; returns its clip id."""
+    if not SAVE_AUDIO:
+        return None
+    try:
+        clips_dir = os.path.join(SAVE_DIR, "clips")
+        os.makedirs(clips_dir, exist_ok=True)
+        clip_id = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+        with wave.open(os.path.join(clips_dir, f"{clip_id}.wav"), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(pcm.tobytes())
+        return clip_id
+    except Exception:
+        _log("[dictate] ERROR saving audio clip:")
+        traceback.print_exc(file=_log_file)
+        return None
+
+
+def _save_metadata(clip_id: str, audio: np.ndarray, hypothesis: str):
+    """Append the clip's record to SAVE_DIR/metadata.jsonl.
+
+    `transcription` is the reference text: empty until the clip is reviewed and
+    corrected. `hypothesis` is what Whisper produced.
+    """
+    record = {
+        "file_name": f"clips/{clip_id}.wav",
+        "id": clip_id,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "duration_s": round(len(audio) / SAMPLE_RATE, 2),
+        "model": WHISPER_MODEL if MODEL == "whisper" else MODELS[MODEL],
+        "initial_prompt": WHISPER_INITIAL_PROMPT if MODEL == "whisper" else "",
+        "keywords": KEYWORDS if MODEL == "granite" else "",
+        "hypothesis": hypothesis,
+        "transcription": "",
+    }
+    try:
+        with open(os.path.join(SAVE_DIR, "metadata.jsonl"), "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        _log("[dictate] ERROR writing clip metadata:")
+        traceback.print_exc(file=_log_file)
+
+
 def _transcribe_and_type():
     try:
         with _lock:
@@ -272,9 +424,13 @@ def _transcribe_and_type():
         if not chunks:
             return
         audio = np.concatenate(chunks).flatten()
+        # Save before transcribing so the audio survives a transcription crash.
+        clip_id = _save_clip(audio)
         print("\r[dictate] Transcribing...              ", end="", flush=True)
-        result = _model.transcribe(audio, fp16=(_device == "cuda"), initial_prompt=WHISPER_INITIAL_PROMPT)
-        text = result["text"].strip()
+        text = _transcribe(audio)
+        if clip_id:
+            _save_metadata(clip_id, audio, text)
+            _log(f"[dictate] clip {clip_id} → {text!r}")
         if text:
             print(f"\r[dictate] → {text}                     ", flush=True)
             try:
