@@ -83,24 +83,44 @@ WHISPER_MODEL = "turbo"  # large-v3-turbo: near large-v3 accuracy at ~8x speed; 
 
 # Selectable speech-to-text models (--model / DICTATE_MODEL). All are open weights
 # and run locally; the HF ones are downloaded on first use.
+#   qwen3    Qwen3-ASR 1.7B — the default; biased towards vocabulary.txt (names, jargon).
+#            Best at the names/jargon in the dictation failure set (see
+#            asr-whisper-finetuning/data/dictation-results/comparison_summary.csv)
 #   whisper  openai-whisper large-v3-turbo (809M) — the original default
 #   granite  IBM Granite Speech 4.1 2B — supports keyword biasing (--keywords)
 #   cohere   Cohere Transcribe 03-2026 (2B) — gated on Hugging Face: accept the
 #            terms on its model page and run `hf auth login` once before using it
 MODELS = {
+    "qwen3": "Qwen/Qwen3-ASR-1.7B-hf",
     "whisper": f"openai-whisper/{WHISPER_MODEL}",
     "granite": "ibm-granite/granite-speech-4.1-2b",
     "cohere": "CohereLabs/cohere-transcribe-03-2026",
 }
 
 _parser = argparse.ArgumentParser(description="Hold-to-dictate voice typing")
-_parser.add_argument("--model", choices=sorted(MODELS), default=os.environ.get("DICTATE_MODEL", "whisper"),
-                     help="Speech-to-text model (default: $DICTATE_MODEL or whisper)")
+_parser.add_argument("--model", choices=sorted(MODELS), default=os.environ.get("DICTATE_MODEL", "qwen3"),
+                     help="Speech-to-text model (default: $DICTATE_MODEL or qwen3)")
 _parser.add_argument("--keywords", default=os.environ.get("DICTATE_KEYWORDS", ""),
-                     help="granite: comma-separated words to bias towards, e.g. 'Asana, RLC, LoRA'")
+                     help="qwen3/granite: comma-separated words to bias towards, e.g. 'Asana, RLC, LoRA' "
+                          "(default: the contents of vocabulary.txt next to this script)")
 _args, _ = _parser.parse_known_args()
 MODEL = _args.model
-KEYWORDS = _args.keywords.strip()
+VOCAB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vocabulary.txt")
+
+
+def _load_keywords() -> str:
+    """--keywords / $DICTATE_KEYWORDS if given, else vocabulary.txt (re-read on every call,
+    so terms added while dictate.py is running apply to the next recording)."""
+    if _args.keywords.strip():
+        return _args.keywords.strip()
+    try:
+        with open(VOCAB_FILE) as f:
+            return " ".join(f.read().split())
+    except OSError:
+        return ""
+
+
+KEYWORDS = _load_keywords()
 
 # Whisper defaults to American spelling. Seeding the decoder with an initial_prompt
 # written in British English biases it to continue in the same style/spelling
@@ -284,14 +304,14 @@ def _load_granite(device: str):
         MODELS["granite"], device_map=device, dtype=torch.bfloat16
     ).eval()
 
-    instruction = "<|audio|>transcribe the speech with proper punctuation and capitalization."
-    if KEYWORDS:
-        instruction += f" Keywords: {KEYWORDS}"
-    prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": instruction}], tokenize=False, add_generation_prompt=True
-    )
-
     def transcribe(audio: np.ndarray) -> str:
+        instruction = "<|audio|>transcribe the speech with proper punctuation and capitalization."
+        keywords = _load_keywords()
+        if keywords:
+            instruction += f" Keywords: {keywords}"
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": instruction}], tokenize=False, add_generation_prompt=True
+        )
         wav = torch.from_numpy(audio).float().unsqueeze(0)
         inputs = processor(prompt, wav, device=device, return_tensors="pt").to(device)
         # Leave room for fast speech: ~4 tokens per second of audio, at least 200.
@@ -327,9 +347,31 @@ def _load_cohere(device: str):
     return transcribe
 
 
-_LOADERS = {"whisper": _load_whisper, "granite": _load_granite, "cohere": _load_cohere}
+def _load_qwen3(device: str):
+    import torch
+    from transformers import AutoProcessor, Qwen3ASRForConditionalGeneration
 
-_log(f"[dictate] Loading {MODEL} ({MODELS[MODEL]})" + (f", keywords: {KEYWORDS}" if MODEL == "granite" and KEYWORDS else "") + "...")
+    processor = AutoProcessor.from_pretrained(MODELS["qwen3"])
+    model = Qwen3ASRForConditionalGeneration.from_pretrained(
+        MODELS["qwen3"], device_map=device, dtype=torch.bfloat16
+    ).eval()
+
+    def transcribe(audio: np.ndarray) -> str:
+        # vocabulary.txt goes in the system prompt as context/hotwords; forcing English skips language ID.
+        inputs = processor.apply_transcription_request(audio, language="English", prompt=_load_keywords() or None)
+        inputs = inputs.to(model.device, dtype=model.dtype)
+        max_new_tokens = max(256, int(5 * len(audio) / SAMPLE_RATE))
+        with torch.no_grad():
+            ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, num_beams=1)
+        new_tokens = ids[:, inputs["input_ids"].shape[-1]:]
+        return processor.decode(new_tokens[0], return_format="transcription_only").strip()
+
+    return transcribe
+
+
+_LOADERS = {"qwen3": _load_qwen3, "whisper": _load_whisper, "granite": _load_granite, "cohere": _load_cohere}
+
+_log(f"[dictate] Loading {MODEL} ({MODELS[MODEL]})" + (f", {len(KEYWORDS.split(','))} keywords" if MODEL in ("qwen3", "granite") and KEYWORDS else "") + "...")
 _device = _get_device()
 try:
     _transcribe = _LOADERS[MODEL](_device)
@@ -396,7 +438,7 @@ def _save_metadata(clip_id: str, audio: np.ndarray, hypothesis: str):
     """Append the clip's record to SAVE_DIR/metadata.jsonl.
 
     `transcription` is the reference text: empty until the clip is reviewed and
-    corrected. `hypothesis` is what Whisper produced.
+    corrected. `hypothesis` is what the model produced.
     """
     record = {
         "file_name": f"clips/{clip_id}.wav",
@@ -405,7 +447,7 @@ def _save_metadata(clip_id: str, audio: np.ndarray, hypothesis: str):
         "duration_s": round(len(audio) / SAMPLE_RATE, 2),
         "model": WHISPER_MODEL if MODEL == "whisper" else MODELS[MODEL],
         "initial_prompt": WHISPER_INITIAL_PROMPT if MODEL == "whisper" else "",
-        "keywords": KEYWORDS if MODEL == "granite" else "",
+        "keywords": _load_keywords() if MODEL in ("qwen3", "granite") else "",
         "hypothesis": hypothesis,
         "transcription": "",
     }

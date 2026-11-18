@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Personal dictation vocabulary (private names)
+vocabulary.txt

@@ -29,13 +29,13 @@ Four independent scripts — no shared library, no imports between them:
 |--------|---------|
 | `monitor.py` | Polls every 3s for Zoom/Meet, drives `ffmpeg` to record, runs WhisperX transcription in a background thread. System tray via `pystray`. |
 | `transcribe.py` | Batch mode: scans a directory for `.wav` files without a matching `.txt` and transcribes them with WhisperX. |
-| `dictate.py` | Holds a keyboard hotkey (Ctrl+Shift+Space toggle), records mic via `sounddevice`, transcribes with `openai-whisper`, and types output into the focused window. |
+| `dictate.py` | Holds a keyboard hotkey (Ctrl+Shift+Space toggle), records mic via `sounddevice`, transcribes with Qwen3-ASR 1.7B by default (`--model whisper/granite/cohere` for the others), biased towards the names/jargon in `vocabulary.txt` (re-read on every recording; add terms with `python3 add_vocab.py <term>...`), and types output into the focused window. Each clip is staged in `/tmp/dictate-clips` so mis-transcriptions can be added to the ASR dataset in `~/playground/asr-whisper-finetuning` (`src/add_clip.py`). |
 | `analyze.py` | Reads `.txt` transcripts, sends them to Claude (`claude-sonnet-4-6`) with a structured prompt, and writes `_analysis.md` files into the Obsidian vault at `~/playground/Obsidian/Transcripts/`. |
 
-### Two different Whisper stacks
+### Two different speech-to-text stacks
 
 - `monitor.py` and `transcribe.py` use **WhisperX** (`whisperx`) — adds word-level alignment and speaker diarization via pyannote. Runs on NVIDIA CUDA via `ctranslate2`.
-- `dictate.py` uses **openai-whisper** (`whisper`) — simpler, lower latency, single-speaker. Runs on AMD ROCm via PyTorch (`torch==2.11.0+rocm7.2`).
+- `dictate.py` defaults to **Qwen3-ASR** (`Qwen/Qwen3-ASR-1.7B-hf` via transformers), with `vocabulary.txt` passed as context/hotwords; **openai-whisper** turbo is still available with `--model whisper`. Single-speaker, runs on AMD ROCm via PyTorch (`torch==2.11.0+rocm7.2`). Models were compared on the dictation failure set in `~/playground/asr-whisper-finetuning` (`src/compare_dictation.py`).
 
 GPU detection differs accordingly: WhisperX checks `ctranslate2.get_cuda_device_count()`; dictate uses `torch.cuda.is_available()`.
 
