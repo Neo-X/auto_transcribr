@@ -71,11 +71,11 @@ def _signal_handler(signum, frame):
     sys.exit(0)
 
 
-for _sig in (signal.SIGTERM, signal.SIGHUP):
-    signal.signal(_sig, _signal_handler)
-# SIGINT is left as default (raises KeyboardInterrupt) so genuine Ctrl+C still works.
-
-atexit.register(lambda: _log("Process exiting via atexit."))
+def _install_handlers():
+    for _sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(_sig, _signal_handler)
+    # SIGINT is left as default (raises KeyboardInterrupt) so genuine Ctrl+C still works.
+    atexit.register(lambda: _log("Process exiting via atexit."))
 
 
 SAMPLE_RATE = 16000
@@ -103,8 +103,12 @@ _parser.add_argument("--model", choices=sorted(MODELS), default=os.environ.get("
 _parser.add_argument("--keywords", default=os.environ.get("DICTATE_KEYWORDS", ""),
                      help="qwen3/granite: comma-separated words to bias towards, e.g. 'Asana, RLC, LoRA' "
                           "(default: the contents of vocabulary.txt next to this script)")
+_parser.add_argument("--no-stream", action="store_true", default=os.environ.get("DICTATE_STREAM", "1") == "0",
+                     help="qwen3: transcribe only after the recording stops, instead of also while you speak "
+                          "(also: DICTATE_STREAM=0)")
 _args, _ = _parser.parse_known_args()
 MODEL = _args.model
+STREAM = not _args.no_stream
 VOCAB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vocabulary.txt")
 
 
@@ -273,6 +277,9 @@ def _get_device() -> str:
     # to enumerate devices correctly; set it here if not already provided.
     if "ROCR_VISIBLE_DEVICES" not in os.environ:
         os.environ["ROCR_VISIBLE_DEVICES"] = "0"
+    # MIOpen (ROCm) otherwise runs a ~25 s convolution-algorithm search the first time it
+    # sees each new audio length, which makes long (rarely seen) clip lengths very slow.
+    os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
     try:
         import torch
         if torch.cuda.is_available():
@@ -356,31 +363,53 @@ def _load_qwen3(device: str):
         MODELS["qwen3"], device_map=device, dtype=torch.bfloat16
     ).eval()
 
-    def transcribe(audio: np.ndarray) -> str:
+    eos = model.generation_config.eos_token_id
+    eos = set(eos if isinstance(eos, (list, tuple)) else [eos])
+
+    def transcribe(audio: np.ndarray, prefix: list[int] | None = None, return_ids: bool = False):
+        """Transcribe `audio`. `prefix` is the start of the answer as token ids (from an earlier
+        call on the first part of the same audio): the model continues from it instead of
+        writing it again. With return_ids, returns (text, answer token ids without the end token)."""
         # vocabulary.txt goes in the system prompt as context/hotwords; forcing English skips language ID.
         inputs = processor.apply_transcription_request(audio, language="English", prompt=_load_keywords() or None)
         inputs = inputs.to(model.device, dtype=model.dtype)
+        n_prompt = inputs["input_ids"].shape[-1]
+        if prefix:
+            extra = torch.tensor([prefix], device=model.device, dtype=inputs["input_ids"].dtype)
+            inputs["input_ids"] = torch.cat([inputs["input_ids"], extra], dim=-1)
+            inputs["attention_mask"] = torch.cat([inputs["attention_mask"], torch.ones_like(extra)], dim=-1)
         max_new_tokens = max(256, int(5 * len(audio) / SAMPLE_RATE))
         with torch.no_grad():
             ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, num_beams=1)
-        new_tokens = ids[:, inputs["input_ids"].shape[-1]:]
-        return processor.decode(new_tokens[0], return_format="transcription_only").strip()
+        answer = ids[0, n_prompt:].tolist()
+        while answer and answer[-1] in eos:
+            answer.pop()
+        text = processor.decode(answer, return_format="transcription_only").strip()
+        return (text, answer) if return_ids else text
 
+    transcribe.supports_prefix = True
     return transcribe
 
 
 _LOADERS = {"qwen3": _load_qwen3, "whisper": _load_whisper, "granite": _load_granite, "cohere": _load_cohere}
 
-_log(f"[dictate] Loading {MODEL} ({MODELS[MODEL]})" + (f", {len(KEYWORDS.split(','))} keywords" if MODEL in ("qwen3", "granite") and KEYWORDS else "") + "...")
-_device = _get_device()
-try:
-    _transcribe = _LOADERS[MODEL](_device)
-except OSError as exc:
-    if "gated" in str(exc).lower():
-        _log(f"[dictate] {MODELS[MODEL]} is gated: accept its terms at https://huggingface.co/{MODELS[MODEL]} "
-             "and run `hf auth login`, then restart.")
-    raise
-_log(f"[dictate] Ready on {_device}. Hold Ctrl+Shift+Space to dictate.")
+_transcribe = None  # set by _load_model()
+
+
+def _load_model():
+    """Load the speech model. Called once at start-up (not at import, so tests can import this file)."""
+    global _transcribe
+    _log(f"[dictate] Loading {MODEL} ({MODELS[MODEL]})" + (f", {len(KEYWORDS.split(','))} keywords" if MODEL in ("qwen3", "granite") and KEYWORDS else "") + "...")
+    device = _get_device()
+    try:
+        _transcribe = _LOADERS[MODEL](device)
+    except OSError as exc:
+        if "gated" in str(exc).lower():
+            _log(f"[dictate] {MODELS[MODEL]} is gated: accept its terms at https://huggingface.co/{MODELS[MODEL]} "
+                 "and run `hf auth login`, then restart.")
+        raise
+    _log(f"[dictate] Ready on {device}. Hold Ctrl+Shift+Space to dictate.")
+    return _transcribe
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +418,7 @@ _log(f"[dictate] Ready on {_device}. Hold Ctrl+Shift+Space to dictate.")
 
 _recording = False
 _audio_chunks: list[np.ndarray] = []
+_audio_stream = None  # the finished recording's _Stream (what was transcribed while it was recording)
 _current_keys: set = set()
 _rec_thread: threading.Thread | None = None
 _lock = threading.Lock()
@@ -397,8 +427,76 @@ _target_is_terminal: bool = False
 _combo_latched = False
 
 
+# Transcribing while speaking (qwen3 only). Writing the text costs about 0.2 s per second of
+# audio, so a long dictation transcribed only after the key is released means a long wait
+# (20 s for 100 s of speech). Instead, while the recording is still going, the audio so far is
+# transcribed every STREAM_STEP_S seconds, each pass continuing from the text of the pass
+# before it rather than writing it again. The last STREAM_HOLD tokens of a pass are not kept:
+# they were written without knowing what comes next, so the next pass writes them afresh.
+# On release, one last pass over the whole recording only has to write the final stretch.
+# Recordings shorter than STREAM_STEP_S are transcribed in one go, as before.
+# The step is a trade: text settled early is written with less of the recording to go on and
+# is slightly less accurate (numbers spelled out, an odd changed word). On tests/test_streaming.py
+# --quick, a 10 s step raised the word error rate from 5.9% to 7.5%; 20 s stayed within 0.5 points.
+STREAM_STEP_S = float(os.environ.get("DICTATE_STREAM_STEP", "20"))
+STREAM_HOLD = int(os.environ.get("DICTATE_STREAM_HOLD", "10"))
+
+
+class _Stream:
+    """One recording's transcription while it is still being recorded."""
+
+    def __init__(self, transcribe):
+        self._transcribe = transcribe
+        self.kept: list[int] = []   # tokens of the answer settled so far
+        self.covered = 0            # samples of audio seen by the last pass
+        self.passes = 0
+        self.failed = False
+        self._done = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def step(self, audio: np.ndarray):
+        """One pass over the recording so far; keeps all of its text but the last STREAM_HOLD tokens."""
+        _, ids = self._transcribe(audio, prefix=self.kept, return_ids=True)
+        self.kept = ids[: max(len(self.kept), len(ids) - STREAM_HOLD)]
+        self.covered = len(audio)
+        self.passes += 1
+
+    def finish(self, audio: np.ndarray) -> str:
+        """The text of the whole recording, continuing from what the passes settled."""
+        if self._thread is not None:
+            self._done.set()
+            self._thread.join()
+        if self.failed:
+            self.kept = []
+        text, _ = self._transcribe(audio, prefix=self.kept, return_ids=True)
+        return text
+
+    def follow(self, chunks: list[np.ndarray]):
+        """Start a background thread that runs a pass whenever `chunks` (the list the recording
+        loop is appending to) has grown by STREAM_STEP_S since the last pass."""
+        def run():
+            while not self._done.wait(0.1):
+                n = len(chunks)
+                if n * 1024 - self.covered < STREAM_STEP_S * SAMPLE_RATE:
+                    continue
+                try:
+                    self.step(np.concatenate(chunks[:n]).flatten())
+                except Exception:
+                    self.failed = True
+                    _log("[dictate] ERROR transcribing while recording (the clip will be transcribed in one go):")
+                    traceback.print_exc(file=_log_file)
+                    return
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
+
+
 def _record():
+    global _audio_stream
     chunks = []
+    stream_state = None
+    if STREAM and getattr(_transcribe, "supports_prefix", False):
+        stream_state = _Stream(_transcribe)
+        stream_state.follow(chunks)
     try:
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32") as stream:
             while _recording:
@@ -411,6 +509,7 @@ def _record():
     with _lock:
         _audio_chunks.clear()
         _audio_chunks.extend(chunks)
+        _audio_stream = stream_state
 
 
 def _save_clip(audio: np.ndarray) -> str | None:
@@ -463,13 +562,20 @@ def _transcribe_and_type():
     try:
         with _lock:
             chunks = list(_audio_chunks)
+            stream_state = _audio_stream
         if not chunks:
             return
         audio = np.concatenate(chunks).flatten()
         # Save before transcribing so the audio survives a transcription crash.
         clip_id = _save_clip(audio)
         print("\r[dictate] Transcribing...              ", end="", flush=True)
-        text = _transcribe(audio)
+        if stream_state is not None:
+            text = stream_state.finish(audio)
+            if stream_state.passes:
+                _log(f"[dictate] {stream_state.covered / SAMPLE_RATE:.0f} s of {len(audio) / SAMPLE_RATE:.0f} s "
+                     f"transcribed while recording ({stream_state.passes} passes)")
+        else:
+            text = _transcribe(audio)
         if clip_id:
             _save_metadata(clip_id, audio, text)
             _log(f"[dictate] clip {clip_id} → {text!r}")
@@ -783,6 +889,8 @@ def main():
 
 
 if __name__ == "__main__":
+    _install_handlers()
+    _load_model()
     _log(f"[dictate] Started. PID={os.getpid()}")
     try:
         main()

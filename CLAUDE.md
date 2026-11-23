@@ -43,8 +43,15 @@ GPU detection differs accordingly: WhisperX checks `ctranslate2.get_cuda_device_
 
 Recording, transcription, and text injection are split across threads:
 1. `_record()` — runs in a daemon thread while `_recording` is True, appends chunks to `_audio_chunks`.
-2. `_transcribe_and_type()` — runs in a daemon thread after recording stops; calls `_model.transcribe()` then `type_text()`.
-3. Hotkey detection runs either via `pynput` keyboard listener (X11) or a `select`-based `evdev` loop (Wayland). Both call `_toggle_recording()`.
+2. `_Stream` (qwen3 only; off with `--no-stream` / `DICTATE_STREAM=0`) — while the recording is still going, a background thread transcribes the audio so far every `STREAM_STEP_S` (20 s; shorter steps cost accuracy, see the comment in the code). Each pass continues from the text of the pass before it (passed to the model as the start of its answer) minus the last `STREAM_HOLD` (10) tokens, which the next pass writes afresh with more audio. This is what keeps the wait after release short on long dictations: writing text costs about 0.2 s per second of audio.
+3. `_transcribe_and_type()` — runs in a daemon thread after recording stops; `_Stream.finish()` does one last pass over the whole recording (a plain one-go transcription if the recording was shorter than one step), then `type_text()`.
+4. Hotkey detection runs either via `pynput` keyboard listener (X11) or a `select`-based `evdev` loop (Wayland). Both call `_toggle_recording()`.
+
+The model is loaded by `_load_model()` from the `__main__` block, not at import, so `tests/` can import `dictate`. `_get_device()` sets `MIOPEN_FIND_MODE=FAST`: without it ROCm spends ~25 s searching for convolution algorithms the first time it sees each new audio length.
+
+### Tests
+
+`uv run --no-sync python tests/test_streaming.py --quick` (about 5 minutes on the laptop, a fixed sample of 28 labelled clips listed in `tests/quick_clips.json`; without `--quick` it runs every clip, 40+ minutes; loads the model on the GPU) checks the model's word error rate on the labelled clips in `~/playground/asr-whisper-finetuning/data/dictation` against `tests/baseline.json`, and that transcribing while recording gives the same quality as one-go transcription with a much shorter wait, by replaying saved clips against a clock. Run it after changing the model, the prompt, or the `_Stream` code; `--update-baseline` accepts a new accuracy level. Results go to `tests/results/`.
 
 Text injection tries backends in order: `wtype` → `ydotool` → `xdotool`+clipboard → clipboard-only.
 

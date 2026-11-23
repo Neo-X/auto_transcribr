@@ -11,3 +11,4 @@ wheels/
 
 # Personal dictation vocabulary (private names)
 vocabulary.txt
+tests/results/
