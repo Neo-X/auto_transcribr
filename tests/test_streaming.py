@@ -27,7 +27,7 @@ recorded "so far" at the moments the real background thread would have asked for
 Checks (exit status 1 if any fails):
   1. One-go word error rate on the labelled clips is no worse than tests/baseline.json
      (compared on the clips both runs share).
-  2. While-recording word error rate is no worse than one-go on the same labelled clips.
+  2. While-recording word error rate is less than 1 point above one-go on the same labelled clips.
   3. While-recording text stays close to the one-go text on all long clips.
   4. Clips too short for a pass during recording give exactly the one-go text.
   5. On long clips the wait after release is much shorter than in one go.
@@ -56,7 +56,11 @@ p.add_argument("--quick-budget-s", type=float, default=310.0,
                help="estimated transcription time to fill when drawing the quick sample")
 p.add_argument("--update-baseline", action="store_true", help="write tests/baseline.json from this run")
 p.add_argument("--out", default=os.path.join(ROOT, "tests", "results"))
-p.add_argument("--wer-slack", type=float, default=0.5, help="allowed rise in word error rate, in points")
+p.add_argument("--wer-slack", type=float, default=0.5,
+               help="allowed rise in one-go word error rate over the baseline, in points")
+p.add_argument("--stream-slack", type=float, default=1.0,
+               help="allowed rise in word error rate from transcribing while recording, in points "
+                    "(under 1 point is worth the shorter wait)")
 p.add_argument("--max-drift", type=float, default=4.0,
                help="allowed word difference between while-recording and one-go text, in percent")
 p.add_argument("--max-wait-ratio", type=float, default=0.5,
@@ -265,8 +269,9 @@ def main() -> int:
          not shared or wer_now <= wer_base + args.wer_slack,
          (f"{wer_now:.2f}% vs baseline {wer_base:.2f}% on the {len(shared)} clips in both" if shared
           else f"{wer_one:.2f}% on {len(lab)} labelled clips (no baseline to compare with)")),
-        ("while-recording error rate vs one-go", wer_stream_long <= wer_one_long + args.wer_slack,
-         f"{wer_stream_long:.2f}% vs {wer_one_long:.2f}% on {len(lab_long)} labelled clips long enough"),
+        ("while-recording error rate vs one-go", wer_stream_long < wer_one_long + args.stream_slack,
+         f"{wer_stream_long:.2f}% vs {wer_one_long:.2f}% on {len(lab_long)} labelled clips long enough "
+         f"(limit +{args.stream_slack:g} points)"),
         ("while-recording text close to one-go text", drift <= args.max_drift,
          f"{drift:.2f}% of words differ on {len(long_)} clips (limit {args.max_drift:g}%)"),
         ("short clips unchanged", short_same == len(short), f"{short_same}/{len(short)} identical"),

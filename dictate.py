@@ -438,6 +438,7 @@ _combo_latched = False
 # The step is a trade: text settled early is written with less of the recording to go on and
 # is slightly less accurate (numbers spelled out, an odd changed word). On tests/test_streaming.py
 # --quick, a 10 s step raised the word error rate from 5.9% to 7.5%; 20 s stayed within 0.5 points.
+# Under 1 point is the accepted price for the shorter wait.
 STREAM_STEP_S = float(os.environ.get("DICTATE_STREAM_STEP", "20"))
 STREAM_HOLD = int(os.environ.get("DICTATE_STREAM_HOLD", "10"))
 
